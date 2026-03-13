@@ -729,15 +729,9 @@ int main (int argc, char *argv[])
     /* broadcast file mode to all procs */
     MPI_Bcast(&mode, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    /* identify number of reader tasks and assign a rank to each one */
-
-    /* tasks with node_rank == 0 are excluded from this set */
-    int reader_size = ranks - level_size;
-
-    /* assign ranks so that readers on the same node are in
-     * consecutive order (remember to exclude node_rank == 0 from
-     * each node) */
-    int reader_rank = level_rank * (node_size - 1) + (node_rank - 1);
+    /* only the root node (level_rank == 0) has readers;
+     * reader_size is the number of readers on that node */
+    int reader_size = node_size - 1;
 
     /* rank 0 on each node will write file, others will read from input */
     if (node_rank == 0) {
@@ -808,12 +802,14 @@ int main (int argc, char *argv[])
             }
         }
     } else {
-        /* open input file for reading if we're a reader */
-        errno = 0;
-        in_file = mfu_open(in_file_path, O_RDONLY);
-        if (in_file < 0) {
-            MFU_LOG(MFU_LOG_ERR, "Failed to open file `%s` for reading (%s)", in_file_path, strerror(errno));
-            file_bcast_exit();
+        /* only root node readers (level_rank == 0) open the input file */
+        if (level_rank == 0) {
+            errno = 0;
+            in_file = mfu_open(in_file_path, O_RDONLY);
+            if (in_file < 0) {
+                MFU_LOG(MFU_LOG_ERR, "Failed to open file `%s` for reading (%s)", in_file_path, strerror(errno));
+                file_bcast_exit();
+            }
         }
     }
 
@@ -824,107 +820,53 @@ int main (int argc, char *argv[])
 
     double time_start = MPI_Wtime();
 
-    /* compute rank on left side */
-    int left = level_rank - 1;
-    if (left < 0) {
-      left = level_size - 1;
-    }
-
-    /* compute rank on right size */
-    int right = level_rank + 1;
-    if (right == level_size) {
-      right = 0;
-    }
-
 /* readers */
 if (node_rank != 0) {
-    /* read back parts of output file and broadcast */
-    MPI_Request request[3];
-    MPI_Status  status[3];
+    MPI_Status  status;
     size_t bytes_read = 0;
     while (bytes_read < file_size) {
         /* process series of chunks in this stripe */
         uint64_t chunk_id = 0;
         uint64_t stripe_read = 0;
         while (stripe_read < stripe_size) {
-            /* we'll send from buf1 and receive into buf2,
-             * read data from file into buf1 to begin */
+            /* each reader handles only its own stripe */
             int shmid = (node_rank - 1) * 2;
-            void* buf1 = shmbuf[shmid + 0];
-            void* buf2 = shmbuf[shmid + 1];
+            void* buf = shmbuf[shmid];
 
-            /* get offset and size of bytes to read */
-            off_t pos1;
-            size_t size1;
+            /* get offset and size for our chunk */
+            off_t pos;
+            size_t size;
             compute_offset_size(
-                bytes_read, stripe_read, file_size, stripe_size, chunk_size, reader_rank, chunk_id,
-                &pos1, &size1
+                bytes_read, stripe_read, file_size, stripe_size, chunk_size, node_rank - 1, chunk_id,
+                &pos, &size
             );
 
-            /* seek to offset in input file */
-            if (size1 > 0) {
+            /* root reader reads data from file into shared memory */
+            if (level_rank == 0 && size > 0) {
                 errno = 0;
-                off_t rc = mfu_lseek(in_file_path, in_file, pos1, SEEK_SET);
+                off_t rc = mfu_lseek(in_file_path, in_file, pos, SEEK_SET);
                 if (rc == (off_t)-1) {
-                    MFU_LOG(MFU_LOG_ERR, "Seek failed on file `%s` (%s)", out_file_path, strerror(errno));
+                    MFU_LOG(MFU_LOG_ERR, "Seek failed on file `%s` (%s)", in_file_path, strerror(errno));
                     file_bcast_exit();
                 }
 
-                /* read chunk from file */
                 errno = 0;
-                ssize_t return_size = mfu_read(in_file_path, in_file, buf1, size1);
-                if (return_size != (ssize_t)size1) {
-                    MFU_LOG(MFU_LOG_ERR, "Failed to read contents from `%s` (%s)", out_file_path, strerror(errno));
+                ssize_t return_size = mfu_read(in_file_path, in_file, buf, size);
+                if (return_size != (ssize_t)size) {
+                    MFU_LOG(MFU_LOG_ERR, "Failed to read contents from `%s` (%s)", in_file_path, strerror(errno));
                     file_bcast_exit();
                 }
             }
 
-            /* we send data to the left and receive from the right until
-             * we've received and written all data for this chunk */
-            int lev;
-            for (lev = 1; lev < level_size; lev++) {
-                /* determine source of data we'll receive in this step */
-                int lev_incoming = level_rank + lev;
-                if (lev_incoming >= level_size) {
-                    lev_incoming -= level_size;
-                }
-                int read_rank_incoming = lev_incoming * (node_size - 1) + (node_rank - 1);
+            /* root reader broadcasts chunk to all readers with same node_rank across nodes;
+             * non-root readers receive directly into their shared memory buffer */
+            MPI_Bcast(buf, (int)size, MPI_BYTE, 0, level_comm);
 
-                /* get offset and size of incoming data */
-                off_t pos2;
-                size_t size2;
-                compute_offset_size(
-                    bytes_read, stripe_read, file_size, stripe_size, chunk_size, read_rank_incoming, chunk_id,
-                    &pos2, &size2
-                );
-
-                /* signal writer that our buffer is ready */
-                MPI_Send(&shmid, 1, MPI_INT, 0, 0, node_comm);
-
-                /* receieve data from right, send data to left,
-                 * and send data to writer on same node */
-                MPI_Irecv(buf2, (int) size2, MPI_BYTE, right, 0, level_comm, &request[0]);
-                MPI_Isend(buf1, (int) size1, MPI_BYTE, left,  0, level_comm, &request[1]);
-                MPI_Waitall(2, request, status);
-
-                /* wait for signal from writer to know that it's
-                 * finished with our buffer */
-                MPI_Recv(&shmid, 1, MPI_INT, 0, 0, node_comm, &status[0]);
-
-                /* swap buffers to send data we just received */
-                size1 = size2;
-                char* buftmp = buf1;
-                buf1 = buf2;
-                buf2 = buftmp;
-                shmid = (shmid & 0x1) ? (shmid - 1) : (shmid + 1);
-            }
-
-            /* signal writer that our buffer is ready */
+            /* signal local writer that buffer is ready */
             MPI_Send(&shmid, 1, MPI_INT, 0, 0, node_comm);
 
-            /* wait for signal from writer to know that it's
-             * finished with our buffer */
-            MPI_Recv(&shmid, 1, MPI_INT, 0, 0, node_comm, &status[0]);
+            /* wait for local writer to finish with our buffer */
+            MPI_Recv(&shmid, 1, MPI_INT, 0, 0, node_comm, &status);
 
             /* go on to next chunk */
             stripe_read += chunk_size;
@@ -940,134 +882,120 @@ if (node_rank != 0) {
 /* writers */
 if (node_rank == 0) {
     double percent = 2.0;
-    char* readbuf = (char*) malloc(chunk_size);
-//    shmbuf[i] = (char*)base + alignment - ((uint64_t)base & (alignment - 1)) ;
+    char* readbuf  = (char*) malloc(chunk_size);  /* for reading existing file to compare */
 
-    /* read back parts of output file and broadcast */
-    MPI_Request request[2];
-    MPI_Status  status[2];
+    MPI_Status  status;
     size_t bytes_read = 0;
     while (bytes_read < file_size) {
-        /* iterate over all procs on the node,
-         * we process a full stripe one level at at time */
-            /* process series of chunks in this stripe */
-            uint64_t chunk_id = 0;
-            uint64_t stripe_read = 0;
-            while (stripe_read < stripe_size) {
-                /* process this portion of the stripe for all procs at this level */
-                int lev;
-                for (lev = 0; lev < level_size; lev++) {
-                int node;
-                for (node = 1; node < node_size; node++) {
-                    /* determine source of data we'll receive in this step */
-                    int lev_incoming = level_rank + lev;
-                    if (lev_incoming >= level_size) {
-                        lev_incoming -= level_size;
-                    }
-                    int read_rank_incoming = lev_incoming * (node_size - 1) + (node - 1);
+        /* process series of chunks in this stripe */
+        uint64_t chunk_id = 0;
+        uint64_t stripe_read = 0;
+        while (stripe_read < stripe_size) {
+            int node;
+            for (node = 1; node < node_size; node++) {
+                /* reader_rank is node - 1 */
+                int read_rank_incoming = node - 1;
 
-                    /* get offset and size of bytes for this reader */
-                    off_t pos;
-                    size_t size;
-                    compute_offset_size(
-                        bytes_read, stripe_read, file_size, stripe_size, chunk_size, read_rank_incoming, chunk_id,
-                        &pos, &size
-                    );
+                /* get offset and size for this chunk */
+                off_t pos;
+                size_t size;
+                compute_offset_size(
+                    bytes_read, stripe_read, file_size, stripe_size, chunk_size, read_rank_incoming, chunk_id,
+                    &pos, &size
+                );
 
-                    /* wait for node to signal us */
-                    int shmid;
-                    MPI_Recv(&shmid, 1, MPI_INT, node, 0, node_comm, &status[0]);
+                /* wait for local reader to signal that shared memory buffer is ready;
+                 * data was placed there by the reader via Bcast on level_comm */
+                int shmid;
+                MPI_Recv(&shmid, 1, MPI_INT, node, 0, node_comm, &status);
+                void* copybuf = shmbuf[shmid];
 
-                    /* determine buffer to write data from */
-                    void* copybuf = shmbuf[shmid];
+                /* write data to file */
+                if (size > 0) {
+                    /* assume that we'll be writing data */
+                    int write_data = 1;
 
-                    /* write data to file */
-                    if (size > 0) {
-                        /* assume that we'll be writing data */
-                        int write_data = 1;
+                    /* if the file already exists, read in this segment and compare
+                     * it to what we should be writing */
+                    if (file_exists) {
+                        /* file exists, now assume it's the same content so that
+                         * we don't need to write this data */
+                        write_data = 0;
 
-                        /* if the file already exists, read in this segment and compare
-                         * it to what we should be writing */
-                        if (file_exists) {
-                            /* file exists, now assume it's the same content so that
-                             * we don't need to write this data */
-                            write_data = 0;
+                        /* seek to offset in output file */
+                        errno = 0;
+                        int rc = mfu_lseek(out_file_path, out_file, pos, SEEK_SET);
+                        if (rc == (off_t)-1) {
+                            /* consider this a write error since we can't read
+                             * to determine whether we need to write */
+                            MFU_LOG(MFU_LOG_ERR, "Seek failed on file `%s` (%s)", out_file_path, strerror(errno));
+                            write_error = 1;
+                        }
 
-                            /* seek to offset in output file */
-                            errno = 0;
-                            int rc = mfu_lseek(out_file_path, out_file, pos, SEEK_SET);
-                            if (rc == (off_t)-1) {
+                        /* read chunk from file */
+                        errno = 0;
+                        ssize_t return_size = mfu_read(out_file_path, out_file, readbuf, size);
+                        if (return_size == (ssize_t)size) {
+                            /* we read the correct number of bytes, now compare them */
+                            if (memcmp(readbuf, copybuf, size) != 0) {
+                                /* found a difference so overwrite existing data */
+                                write_data = 1;
+                            }
+                        } else {
+                            /* overwrite data if we got a short read or end of file,
+                             * otherwise, we got a read error  */
+                            if (return_size >= 0) {
+                                write_data = 1;
+                            } else {
                                 /* consider this a write error since we can't read
                                  * to determine whether we need to write */
-                                MFU_LOG(MFU_LOG_ERR, "Seek failed on file `%s` (%s)", out_file_path, strerror(errno));
-                                write_error = 1;
-                            }
-
-                            /* read chunk from file */
-                            errno = 0;
-                            ssize_t return_size = mfu_read(out_file_path, out_file, readbuf, size);
-                            if (return_size == (ssize_t)size) {
-                                /* we read the correct number of bytes, now compare them */
-                                if (memcmp(readbuf, copybuf, size) != 0) {
-                                    /* found a difference so overwrite existing data */
-                                    write_data = 1;
-                                }
-                            } else {
-                                /* overwrite data if we got a short read or end of file,
-                                 * otherwise, we got a read error  */
-                                if (return_size >= 0) {
-                                    write_data = 1;
-                                } else {
-                                    /* consider this a write error since we can't read
-                                     * to determine whether we need to write */
-                                    MFU_LOG(MFU_LOG_ERR, "Failed to read from existing file `%s` (%s)", out_file_path, strerror(errno));
-                                    write_error = 1;
-                                }
-                            }
-                        }
-
-                        /* write data to output file */
-                        if (write_data && !write_error) {
-                            /* seek to offset in output file */
-                            errno = 0;
-                            int rc = mfu_lseek(out_file_path, out_file, pos, SEEK_SET);
-                            if (rc == (off_t)-1) {
-                                MFU_LOG(MFU_LOG_ERR, "Seek failed on file `%s` (%s)", out_file_path, strerror(errno));
-                                write_error = 1;
-                            }
-
-                            /* to use O_DIRECT, we have to write in full blocks */
-                            if (size != chunk_size) {
-                                if (pos + size < file_size) {
-                                    /* this is bad, so consider it to be fatal */
-                                    MFU_LOG(MFU_LOG_ERR, "Trying to write past end of chunk in middle block `%s`", out_file_path);
-                                    file_bcast_exit();
-                                }
-                                size = chunk_size;
-                            }
-
-                            /* write chunk to output file */
-                            errno = 0;
-                            ssize_t return_size = mfu_write(out_file_path, out_file, copybuf, size);
-                            if (return_size == -1) {
-                                /* remember that we had a write error,
-                                 * we'll keep going and delete the
-                                 * file at the end */
-                                MFU_LOG(MFU_LOG_ERR, "Failed to write contents to `%s` (%s)", out_file_path, strerror(errno));
+                                MFU_LOG(MFU_LOG_ERR, "Failed to read from existing file `%s` (%s)", out_file_path, strerror(errno));
                                 write_error = 1;
                             }
                         }
                     }
 
-                    /* signal node that we're finished */
-                    MPI_Send(&shmid, 1, MPI_INT, node, 0, node_comm);
-                }
+                    /* write data to output file */
+                    if (write_data && !write_error) {
+                        /* seek to offset in output file */
+                        errno = 0;
+                        int rc = mfu_lseek(out_file_path, out_file, pos, SEEK_SET);
+                        if (rc == (off_t)-1) {
+                            MFU_LOG(MFU_LOG_ERR, "Seek failed on file `%s` (%s)", out_file_path, strerror(errno));
+                            write_error = 1;
+                        }
+
+                        /* to use O_DIRECT, we have to write in full blocks */
+                        if (size != chunk_size) {
+                            if (pos + size < file_size) {
+                                /* this is bad, so consider it to be fatal */
+                                MFU_LOG(MFU_LOG_ERR, "Trying to write past end of chunk in middle block `%s`", out_file_path);
+                                file_bcast_exit();
+                            }
+                            size = chunk_size;
+                        }
+
+                        /* write chunk to output file */
+                        errno = 0;
+                        ssize_t return_size = mfu_write(out_file_path, out_file, copybuf, size);
+                        if (return_size == -1) {
+                            /* remember that we had a write error,
+                             * we'll keep going and delete the
+                             * file at the end */
+                            MFU_LOG(MFU_LOG_ERR, "Failed to write contents to `%s` (%s)", out_file_path, strerror(errno));
+                            write_error = 1;
+                        }
+                    }
                 }
 
-                /* go on to next chunk */
-                stripe_read += chunk_size;
-                chunk_id++;
+                /* signal local reader that we're finished with its buffer */
+                MPI_Send(&shmid, 1, MPI_INT, node, 0, node_comm);
             }
+
+            /* go on to next chunk */
+            stripe_read += chunk_size;
+            chunk_id++;
+        }
 
         /* record total number of bytes processed, the last set of stripes may
          * not be full but that doesn't matter in this accounting */
@@ -1137,10 +1065,12 @@ if (node_rank == 0) {
             }
         }
     } else {
-        /* readers close input file */
-        errno = 0;
-        if (mfu_close(in_file_path, in_file) != 0) {
-            MFU_LOG(MFU_LOG_ERR, "Failed to close file `%s`", in_file_path, strerror(errno));
+        /* only root node readers opened the input file, so only they close it */
+        if (level_rank == 0) {
+            errno = 0;
+            if (mfu_close(in_file_path, in_file) != 0) {
+                MFU_LOG(MFU_LOG_ERR, "Failed to close file `%s`", in_file_path, strerror(errno));
+            }
         }
     }
 
